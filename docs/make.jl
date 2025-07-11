@@ -11,6 +11,7 @@ makedocs(
     ]
 )
 
+
 deploydocs(
     repo="github.com/ameralo0o/EasyHPC.jl"
 )
