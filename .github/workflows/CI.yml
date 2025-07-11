@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        julia-version: ["1.11"]
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Julia
+        uses: julia-actions/setup-julia@v1
+        with:
+          version: ${{ matrix.julia-version }}
+
+      - name: Cache Julia registries and artifacts
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.julia/registries
+            ~/.julia/artifacts
+          key: ${{ runner.os }}-julia-${{ matrix.julia-version }}-registries-${{ hashFiles('Project.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-julia-${{ matrix.julia-version }}-registries-
+
+      - name: Cache compiled packages
+        uses: actions/cache@v3
+        with:
+          path: ~/.julia/compiled
+          key: ${{ runner.os }}-julia-${{ matrix.julia-version }}-compiled-${{ hashFiles('Manifest.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-julia-${{ matrix.julia-version }}-compiled-
+
+      - name: Install dependencies
+        run: julia --project=. -e 'using Pkg; Pkg.instantiate()'
+
+      - name: Run tests
+        run: julia --project=. -e 'using Pkg; Pkg.test()'

@@ -1,0 +1,284 @@
+
+abstract type Ordering end
+struct Forward <: Ordering end
+struct Reverse <: Ordering end
+
+@inline isless(::Forward, a::T, b::T) where {T} = a < b
+@inline isless(::Reverse, a::T, b::T) where {T} = a > b
+
+const PARALLEL_THRESHOLD = 10_000
+const SMALL_THRESHOLD = 128
+const task_queue = Channel{Tuple{Vector,Int,Int,Ordering,Int}}(Inf)
+
+"""
+    sort_numeric!(v::Vector{T}, o::Ordering = Forward()) where {T <: Real}
+
+Efficient in-place parallel sorting for numeric vectors `v`, using a hybrid introsort strategy with multithreading.
+
+This function dynamically selects the most efficient sorting method depending on the vector's size and order:
+
+- Uses `insertion_sort!` for small vectors (`length ≤ SMALL_THRESHOLD`)
+- Detects already sorted or reverse-sorted input for early return
+- Uses a **parallel introsort** (quicksort + heapsort + insertion sort) for general cases
+- Automatically parallelizes using native Julia threads (`Threads.@spawn` + `Channel`)
+
+### Arguments
+- `v`: A vector of real numbers (`Vector{T}` where `T <: Real`), such as `Vector{Int}` or `Vector{Float64}`
+- `o`: An `Ordering`, either `Forward()` (ascending, default) or `Reverse()` (descending)
+
+### Performance
+- Very fast for large numeric vectors
+- Supports both `Int` and `Float64`
+- Scales with available threads for vectors larger than `PARALLEL_THRESHOLD`
+
+### Example
+```julia
+v1 = rand(Int, 1_000_000)
+sort_numeric!(v1)  # Ascending sort
+
+v2 = randn(1_000_000)
+sort_numeric!(v2, Reverse())  # Descending sort
+```
+"""
+function sort_numeric!(v::Vector{T}, o::Ordering=Forward()) where {T<:Real}
+    n = length(v)
+    n <= SMALL_THRESHOLD && return insertion_sort!(v, o)
+
+    if issorted_custom(v, o)
+        return v
+    elseif issorted_custom(v, reverse_ordering(o))
+        reverse!(v)
+        return v
+    end
+
+    return introsort_queue!(v, o)
+end
+
+
+"""
+    insertion_sort!(v::Vector, o::Ordering)
+
+In-place insertion sort of vector `v` using ordering `o`.
+"""
+
+function insertion_sort!(v::Vector, o::Ordering)
+    return insertion_sort!(v, 1, length(v), o)
+end
+
+"""
+    insertion_sort!(v::Vector, o::Ordering)
+
+Simple in-place insertion sort for small arrays.
+Stable and adaptive to nearly-sorted data.
+"""
+function insertion_sort!(v::Vector, lo::Int, hi::Int, o::Ordering)
+    @inbounds for i in (lo+1):hi
+        temp = v[i]
+        j = i - 1
+        while j >= lo && isless(o, temp, v[j])
+            v[j+1] = v[j]
+            j -= 1
+        end
+        v[j+1] = temp
+    end
+    return v
+end
+
+function issorted_custom(v, o::Ordering)
+    n = length(v)
+    if o isa Forward
+        @inbounds for i in 2:n
+            v[i] < v[i-1] && return false
+        end
+    else
+        @inbounds for i in 2:n
+            v[i] > v[i-1] && return false
+        end
+    end
+    return true
+end
+
+function reverse_ordering(o::Ordering)
+    o isa Forward && return Reverse()
+    o isa Reverse && return Forward()
+end
+
+
+function partition!(v, lo, hi, pivot, o)
+    i = lo
+    j = hi
+    @inbounds while true
+        while i <= j && isless(o, v[i], pivot)
+            i += 1
+        end
+        while i <= j && isless(o, pivot, v[j])
+            j -= 1
+        end
+        i >= j && break
+        @inbounds v[i], v[j] = v[j], v[i]
+        i += 1
+        j -= 1
+    end
+    return j
+end
+
+@inline function median_of_three(a, b, c, o::Ordering)
+    if isless(o, a, b)
+        if isless(o, b, c)
+            return b
+        elseif isless(o, a, c)
+            return c
+        else
+            return a
+        end
+    else
+        if isless(o, a, c)
+            return a
+        elseif isless(o, b, c)
+            return c
+        else
+            return b
+        end
+    end
+end
+
+
+
+
+function worker_loop(task_queue, active_tasks)
+    while true
+        task = try
+            take!(task_queue)
+        catch
+            break
+        end
+        v, lo, hi, o, depth = task
+        parallel_introsort_step!(task_queue, active_tasks, v, lo, hi, o, depth)
+        Threads.atomic_sub!(active_tasks, 1)
+    end
+end
+
+function parallel_introsort_step!(task_queue, active_tasks, v, lo, hi, o, depth)
+    if hi - lo <= SMALL_THRESHOLD
+        insertion_sort!(v, lo, hi, o)
+        return
+    elseif depth <= 0
+        heapsort!(v, lo, hi, o)
+        return
+    end
+
+    mid = lo + ((hi - lo) >>> 1)
+    pivot = median_of_three(v[lo], v[mid], v[hi], o)
+    j = partition!(v, lo, hi, pivot, o)
+
+    if (hi - lo + 1) > 2 * PARALLEL_THRESHOLD
+        Threads.atomic_add!(active_tasks, 2)
+        put!(task_queue, (v, lo, j, o, depth - 1))
+        put!(task_queue, (v, j + 1, hi, o, depth - 1))
+    else
+        parallel_introsort_step!(task_queue, active_tasks, v, lo, j, o, depth - 1)
+        parallel_introsort_step!(task_queue, active_tasks, v, j + 1, hi, o, depth - 1)
+    end
+end
+
+function parallel_introsort_queue!(v::Vector{T}, o::Ordering=Forward()) where {T}
+    task_queue = Channel{Tuple{Vector,Int,Int,Ordering,Int}}(Inf)
+    active_tasks = Threads.Atomic{Int}(0)
+
+    n = length(v)
+    maxdepth = 2 * floor(Int, log2(n))
+    Threads.atomic_add!(active_tasks, 1)
+    put!(task_queue, (v, 1, n, o, maxdepth))
+
+    for _ in 1:Threads.nthreads()
+        Base.Threads.@spawn worker_loop(task_queue, active_tasks)
+    end
+
+    while active_tasks[] > 0
+        sleep(0.001)
+    end
+    close(task_queue)
+end
+
+function introsort_queue!(v::Vector{T}, o::Ordering=Forward()) where {T}
+    parallel_introsort_queue!(v, o)
+end
+
+
+
+
+function heapsort!(v::Vector, lo::Int, hi::Int, o::Ordering)
+    n = hi - lo + 1
+    @inbounds for start in div(n, 2):-1:1
+        sift_down(v, lo, hi, start, o)
+    end
+    @inbounds for last in n:-1:2
+        v[lo], v[lo+last-1] = v[lo+last-1], v[lo]
+        sift_down(v, lo, lo + last - 2, 1, o)
+    end
+    return v
+end
+
+@inline function sift_down(v::Vector, lo::Int, hi::Int, start::Int, o::Ordering)
+    root = start
+    n = hi - lo + 1
+    @inbounds while 2 * root <= n
+        child = 2 * root
+        if child < n && isless(o, v[lo+child-1], v[lo+child])
+            child += 1
+        end
+        if isless(o, v[lo+root-1], v[lo+child-1])
+            v[lo+root-1], v[lo+child-1] = v[lo+child-1], v[lo+root-1]
+            root = child
+        else
+            break
+        end
+    end
+end
+
+
+
+###########
+
+
+function sort_numeric_seq!(v::Vector{T}, o::Ordering=Forward()) where {T<:Real}
+    n = length(v)
+    n <= SMALL_THRESHOLD && return insertion_sort!(v, o)
+
+    if issorted_custom(v, o)
+        return v
+    elseif issorted_custom(v, reverse_ordering(o))
+        reverse!(v)
+        return v
+    end
+    return introsort_seq!(v, 1, n, o, 2 * floor(Int, log2(n)))
+end
+
+
+
+function introsort_seq!(v::Vector, lo::Int, hi::Int, o::Ordering, depth::Int, pdepth::Int=0)
+    if hi - lo <= SMALL_THRESHOLD
+        insertion_sort!(v, lo, hi, o)
+        return v
+    end
+
+    if depth <= 2
+        return heapsort!(v, lo, hi, o)
+    end
+
+
+    mid = lo + ((hi - lo) >>> 1)
+    pivot = try
+        median_of_three(v[lo], v[hi], v[mid], o)
+    catch
+        v[lo]
+    end
+    j = partition!(v, lo, hi, pivot, o)
+
+    introsort_seq!(v, lo, j, o, depth - 1, pdepth)
+    introsort_seq!(v, j + 1, hi, o, depth - 1, pdepth)
+
+    return v
+end
+
+
