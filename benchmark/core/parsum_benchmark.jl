@@ -4,7 +4,7 @@ using Random
 
 
 Random.seed!(1234)
-A = rand(10^6);
+A = rand(10^7);
 println("=== Benchmark: sum ===")
 display(@benchmark sum($A))
 

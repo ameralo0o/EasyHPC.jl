@@ -23,7 +23,7 @@ using Random
 Markdown.parse("Willkommen zu meiner Präsentation über XYZ!")
 
 # ╔═╡ 17ebb91c-87ab-4de6-9ab6-127fc3bf74da
-data1 = rand(Float64, 10^6)  
+data1 = rand(Float64, 10^8)  * 10^8
 
 # ╔═╡ 86ef906f-02d8-4428-92b4-5c246ff17787
 data2 = deepcopy(data1)
@@ -42,6 +42,6 @@ data2 = deepcopy(data1)
 # ╠═62ec4628-207b-4bcd-b721-d258c53f9b71
 # ╟─fc49b7bf-dec1-4e46-935e-c1fe418d05b6
 # ╠═17ebb91c-87ab-4de6-9ab6-127fc3bf74da
-# ╟─86ef906f-02d8-4428-92b4-5c246ff17787
+# ╠═86ef906f-02d8-4428-92b4-5c246ff17787
 # ╠═81e8e17b-b68c-40a8-8394-42a51c82f2bc
 # ╠═28529943-a2aa-47dc-b2d7-0149acb01e21

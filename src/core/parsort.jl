@@ -3,11 +3,13 @@ abstract type Ordering end
 struct Forward <: Ordering end
 struct Reverse <: Ordering end
 
-@inline isless(::Forward, a::T, b::T) where {T} = a < b
-@inline isless(::Reverse, a::T, b::T) where {T} = a > b
+@inline isless(::Forward, a, b) = a < b
+@inline isless(::Reverse, a, b) = a > b
+@inline lt(o::Ordering, a, b) = isless(o, a, b)
+@inline midpoint(lo::Int, hi::Int) = lo + ((hi - lo) >>> 1)
 
 const PARALLEL_THRESHOLD = 10_000
-const SMALL_THRESHOLD = 128
+const SMALL_THRESHOLD = 64
 const task_queue = Channel{Tuple{Vector,Int,Int,Ordering,Int}}(Inf)
 
 """
@@ -26,10 +28,10 @@ This function dynamically selects the most efficient sorting method depending on
 - `v`: A vector of real numbers (`Vector{T}` where `T <: Real`), such as `Vector{Int}` or `Vector{Float64}`
 - `o`: An `Ordering`, either `Forward()` (ascending, default) or `Reverse()` (descending)
 
-### Performance
-- Very fast for large numeric vectors
-- Supports both `Int` and `Float64`
-- Scales with available threads for vectors larger than `PARALLEL_THRESHOLD`
+### WARNING:
+- The parallel introsort uses **quicksort and heapsort**, which are **not stable** sorting algorithms.  
+- This means equal elements may not keep their original order.
+
 
 ### Example
 ```julia
@@ -104,42 +106,42 @@ function reverse_ordering(o::Ordering)
 end
 
 
-function partition!(v, lo, hi, pivot, o)
-    i = lo
-    j = hi
-    @inbounds while true
-        while i <= j && isless(o, v[i], pivot)
-            i += 1
-        end
-        while i <= j && isless(o, pivot, v[j])
-            j -= 1
-        end
-        i >= j && break
-        @inbounds v[i], v[j] = v[j], v[i]
-        i += 1
-        j -= 1
+
+@inline function selectpivot!(v::AbstractVector, lo::Int, hi::Int, o::Ordering)
+    mi = midpoint(lo, hi)
+    if lt(o, v[lo], v[mi])
+        v[mi], v[lo] = v[lo], v[mi]
     end
-    return j
+    if lt(o, v[hi], v[lo])
+        if lt(o, v[hi], v[mi])
+            v[hi], v[lo], v[mi] = v[lo], v[mi], v[hi]
+        else
+            v[hi], v[lo] = v[lo], v[hi]
+        end
+    end
+    return v[lo]
 end
 
-@inline function median_of_three(a, b, c, o::Ordering)
-    if isless(o, a, b)
-        if isless(o, b, c)
-            return b
-        elseif isless(o, a, c)
-            return c
-        else
-            return a
+
+function partition!(v::AbstractVector, lo::Int, hi::Int, o::Ordering)
+    pivot = selectpivot!(v, lo, hi, o)
+    i, j = lo, hi
+    while true
+        i += 1
+        j -= 1
+        while i <= hi && lt(o, v[i], pivot)
+            i += 1
         end
-    else
-        if isless(o, a, c)
-            return a
-        elseif isless(o, b, c)
-            return c
-        else
-            return b
+        while j >= lo && lt(o, pivot, v[j])
+            j -= 1
         end
+        if i >= j
+            break
+        end
+        v[i], v[j] = v[j], v[i]
     end
+    v[lo], v[j] = v[j], pivot
+    return j
 end
 
 
@@ -167,9 +169,7 @@ function parallel_introsort_step!(task_queue, active_tasks, v, lo, hi, o, depth)
         return
     end
 
-    mid = lo + ((hi - lo) >>> 1)
-    pivot = median_of_three(v[lo], v[mid], v[hi], o)
-    j = partition!(v, lo, hi, pivot, o)
+    j = partition!(v, lo, hi, o)
 
     if (hi - lo + 1) > 2 * PARALLEL_THRESHOLD
         Threads.atomic_add!(active_tasks, 2)
@@ -190,14 +190,13 @@ function parallel_introsort_queue!(v::Vector{T}, o::Ordering=Forward()) where {T
     Threads.atomic_add!(active_tasks, 1)
     put!(task_queue, (v, 1, n, o, maxdepth))
 
-    for _ in 1:Threads.nthreads()
-        Base.Threads.@spawn worker_loop(task_queue, active_tasks)
-    end
+    workers = [Base.Threads.@spawn worker_loop(task_queue, active_tasks) for _ in 1:Threads.nthreads()]
 
     while active_tasks[] > 0
         sleep(0.001)
     end
     close(task_queue)
+    foreach(wait, workers)
 end
 
 function introsort_queue!(v::Vector{T}, o::Ordering=Forward()) where {T}
@@ -235,50 +234,3 @@ end
         end
     end
 end
-
-
-
-###########
-
-
-function sort_numeric_seq!(v::Vector{T}, o::Ordering=Forward()) where {T<:Real}
-    n = length(v)
-    n <= SMALL_THRESHOLD && return insertion_sort!(v, o)
-
-    if issorted_custom(v, o)
-        return v
-    elseif issorted_custom(v, reverse_ordering(o))
-        reverse!(v)
-        return v
-    end
-    return introsort_seq!(v, 1, n, o, 2 * floor(Int, log2(n)))
-end
-
-
-
-function introsort_seq!(v::Vector, lo::Int, hi::Int, o::Ordering, depth::Int, pdepth::Int=0)
-    if hi - lo <= SMALL_THRESHOLD
-        insertion_sort!(v, lo, hi, o)
-        return v
-    end
-
-    if depth <= 2
-        return heapsort!(v, lo, hi, o)
-    end
-
-
-    mid = lo + ((hi - lo) >>> 1)
-    pivot = try
-        median_of_three(v[lo], v[hi], v[mid], o)
-    catch
-        v[lo]
-    end
-    j = partition!(v, lo, hi, pivot, o)
-
-    introsort_seq!(v, lo, j, o, depth - 1, pdepth)
-    introsort_seq!(v, j + 1, hi, o, depth - 1, pdepth)
-
-    return v
-end
-
-

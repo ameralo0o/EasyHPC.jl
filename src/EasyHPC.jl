@@ -14,7 +14,7 @@ include("core/parmap.jl")
 include("core/parreduce.jl")
 include("core/parsort.jl")
 
-export parsum, parmap, parreduce, sort_numeric!, sort_numeric_seq!
+export parsum, parmap, parreduce, sort_numeric!
 
 # ─────────────────────────────────────────────────────────────
 # Logic helpers
